@@ -35,6 +35,16 @@ Usage examples
 
   # Only print the config snippet, don't touch any file or launch anything
   python3 setup_devtools_mcp.py --browser edge --print-config-only
+
+  # Find every claude_desktop_config.json on this system (handles packaged/
+  # Microsoft Store installs under AppData\\Local\\Packages\\...)
+  python3 setup_devtools_mcp.py --find-config
+
+  # Remove the chrome-devtools entry from Claude Desktop's config
+  python3 setup_devtools_mcp.py --remove-claude-desktop
+
+  # Same, but for a specific config file (if multiple were found)
+  python3 setup_devtools_mcp.py --remove-claude-desktop --config-path "C:\\Users\\you\\AppData\\Local\\Packages\\Claude_xxx\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json"
 """
 import argparse
 import json
@@ -188,35 +198,94 @@ def mcp_config_snippet(port: int) -> dict:
     }
 
 
-def claude_desktop_config_path() -> Path:
+def candidate_claude_desktop_config_paths() -> list:
+    """Return every plausible location for claude_desktop_config.json on this
+    OS, in priority order. Covers both the standard installer layout and the
+    packaged/sandboxed layout (e.g. Microsoft Store builds land under
+    AppData\\Local\\Packages\\Claude_<hash>\\LocalCache\\Roaming\\Claude)."""
     system = platform.system()
+    candidates = []
+
     if system == "Windows":
-        return Path(os.environ.get("APPDATA", "")) / "Claude" / "claude_desktop_config.json"
+        appdata = os.environ.get("APPDATA", "")
+        localappdata = os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+
+        # Standard (non-packaged) installer location
+        if appdata:
+            candidates.append(Path(appdata) / "Claude" / "claude_desktop_config.json")
+
+        # Packaged/sandboxed (Microsoft Store-style) location — package folder
+        # name includes a publisher hash that varies per install, so glob it.
+        packages_dir = Path(localappdata) / "Packages"
+        if packages_dir.is_dir():
+            for entry in packages_dir.glob("Claude_*"):
+                candidates.append(
+                    entry / "LocalCache" / "Roaming" / "Claude" / "claude_desktop_config.json"
+                )
+
     elif system == "Darwin":
-        return Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
+        candidates.append(
+            Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
+        )
     else:
         # Unofficial/Linux community builds vary; this is the most common location.
-        return Path.home() / ".config" / "Claude" / "claude_desktop_config.json"
+        candidates.append(Path.home() / ".config" / "Claude" / "claude_desktop_config.json")
+
+    return candidates
 
 
-def configure_claude_desktop(port: int):
-    config_path = claude_desktop_config_path()
-    config_path.parent.mkdir(parents=True, exist_ok=True)
+def find_claude_desktop_config(explicit_path: str = None) -> Path:
+    """Resolve the config path to use. If explicit_path is given, use it
+    as-is (created if it doesn't exist yet). Otherwise scan all candidate
+    locations: if exactly one exists, use it; if several exist, refuse to
+    guess and ask the user to disambiguate with --config-path; if none
+    exist, fall back to the first (standard) candidate so a fresh config
+    can be created there."""
+    if explicit_path:
+        return Path(explicit_path).expanduser().resolve()
 
+    candidates = candidate_claude_desktop_config_paths()
+    existing = [c for c in candidates if c.is_file()]
+
+    if len(existing) == 1:
+        return existing[0]
+
+    if len(existing) > 1:
+        print("Multiple claude_desktop_config.json files found on this system:")
+        for c in existing:
+            print(f"  {c}")
+        print("\nRe-run with --config-path \"<one of the paths above>\" to pick one.")
+        sys.exit(1)
+
+    # None found: fall back to the standard location (will be created).
+    return candidates[0] if candidates else Path.home() / "claude_desktop_config.json"
+
+
+def load_config_safely(config_path: Path) -> dict:
+    """Load JSON config, aborting (never overwriting) if it's malformed."""
+    if not config_path.exists():
+        return {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        print(f"WARNING: {config_path} is not valid JSON. "
+              "Aborting so nothing gets overwritten — fix or remove it "
+              "manually, then re-run.")
+        sys.exit(1)
+
+
+def backup_config(config_path: Path):
     if config_path.exists():
         backup_path = config_path.with_suffix(".json.bak")
         shutil.copy2(config_path, backup_path)
         print(f"Existing config backed up to: {backup_path}")
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except json.JSONDecodeError:
-            print("WARNING: existing config file is not valid JSON. "
-                  "Aborting so nothing gets overwritten — fix or remove it "
-                  "manually, then re-run.")
-            sys.exit(1)
-    else:
-        data = {}
+
+
+def configure_claude_desktop(port: int, config_path: Path):
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_config(config_path)
+    data = load_config_safely(config_path)
 
     data.setdefault("mcpServers", {})
     data["mcpServers"].update(mcp_config_snippet(port))
@@ -225,6 +294,32 @@ def configure_claude_desktop(port: int):
         json.dump(data, f, indent=2)
 
     print(f"Updated: {config_path}")
+    print("Restart Claude Desktop for the change to take effect.")
+
+
+def remove_claude_desktop(config_path: Path, server_name: str = "chrome-devtools"):
+    if not config_path.exists():
+        print(f"No config file found at: {config_path}")
+        print("Nothing to remove.")
+        return
+
+    data = load_config_safely(config_path)
+    servers = data.get("mcpServers", {})
+
+    if server_name not in servers:
+        print(f"'{server_name}' is not present in: {config_path}")
+        print("Nothing to remove.")
+        return
+
+    backup_config(config_path)
+    del servers[server_name]
+    data["mcpServers"] = servers
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    print(f"Removed '{server_name}' from: {config_path}")
+    print("Every other configured server was left untouched.")
     print("Restart Claude Desktop for the change to take effect.")
 
 
@@ -238,12 +333,37 @@ def main():
                      help="Dedicated profile directory to use (default: a new temp dir).")
     ap.add_argument("--configure-claude-desktop", action="store_true",
                      help="Also merge the chrome-devtools-mcp entry into Claude Desktop's config (backs up the existing file first).")
+    ap.add_argument("--remove-claude-desktop", action="store_true",
+                     help="Remove the chrome-devtools entry from Claude Desktop's config (backs up first, leaves other servers untouched). Does not launch a browser.")
+    ap.add_argument("--config-path", default=None,
+                     help="Explicit path to claude_desktop_config.json, overriding auto-detection. Use this if --find-config shows multiple candidates, or auto-detection can't find yours (e.g. non-standard/packaged install).")
+    ap.add_argument("--find-config", action="store_true",
+                     help="List every claude_desktop_config.json found on this system (standard and packaged/Microsoft-Store install locations) and exit.")
     ap.add_argument("--print-config-only", action="store_true",
                      help="Just print the MCP config snippet for the given port; don't launch anything or touch any file.")
     args = ap.parse_args()
 
     if args.print_config_only:
         print(json.dumps({"mcpServers": mcp_config_snippet(args.port)}, indent=2))
+        return
+
+    if args.find_config:
+        candidates = candidate_claude_desktop_config_paths()
+        existing = [c for c in candidates if c.is_file()]
+        if not existing:
+            print("No claude_desktop_config.json found in any known location.")
+            print("Checked:")
+            for c in candidates:
+                print(f"  {c}")
+        else:
+            print("Found:")
+            for c in existing:
+                print(f"  {c}")
+        return
+
+    if args.remove_claude_desktop:
+        config_path = find_claude_desktop_config(args.config_path)
+        remove_claude_desktop(config_path)
         return
 
     found = detect_browsers()
@@ -276,7 +396,8 @@ def main():
 
     if args.configure_claude_desktop:
         print()
-        configure_claude_desktop(args.port)
+        config_path = find_claude_desktop_config(args.config_path)
+        configure_claude_desktop(args.port, config_path)
 
 
 if __name__ == "__main__":
