@@ -135,4 +135,5 @@ Install locations are defined in the `BROWSER_PATHS` dict at the top of `setup_d
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE) for details.
+
