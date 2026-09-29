@@ -132,7 +132,3 @@ claude mcp add chrome-devtools -- npx -y chrome-devtools-mcp@latest --browserUrl
 ## Adding a browser or fixing a path
 
 Install locations are defined in the `BROWSER_PATHS` dict at the top of `setup_devtools_mcp.py`. If `--list` doesn't find a browser you have installed, add or correct its path there — PRs welcome.
-
-## License
-
-MIT (or whatever you prefer — update this section before publishing).
